@@ -283,7 +283,7 @@ func findPomXML(commit *object.Commit, pkg string) (*PomXML, string, error) {
 	var names []string
 	var pomXMLs []PomXML
 	commitTree.Files().ForEach(func(f *object.File) error {
-		if !strings.HasSuffix(f.Name, "pom.xml") {
+		if path.Base(f.Name) != "pom.xml" || strings.Contains(f.Name, "src/") {
 			return nil
 		}
 		pomXML, err := getPomXML(commitTree, f.Name)
