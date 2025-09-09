@@ -35,6 +35,7 @@ type DockerBuildExecutor struct {
 	retainContainer  bool
 	retainImage      bool
 	tempDirBase      string
+	maxMemory        string
 }
 
 // NewDockerBuildExecutor creates a new Docker build executor with configuration
@@ -81,6 +82,7 @@ func NewDockerBuildExecutor(config DockerBuildExecutorConfig) (*DockerBuildExecu
 		retainContainer:  config.RetainContainer,
 		retainImage:      config.RetainImage,
 		tempDirBase:      tempBase,
+		maxMemory:        config.MaxMemory,
 	}, nil
 }
 
@@ -94,6 +96,7 @@ type DockerBuildExecutorConfig struct {
 	RetainContainer  bool   // If true, don't use --rm flag to retain containers
 	RetainImage      bool   // If true, don't remove built image after build completes
 	TempDirBase      string // Base directory for temp files, if empty uses os.TempDir()
+	MaxMemory        string // Max memory for build container, e.g. "4g" for 4GB
 }
 
 // Start implements build.Executor.
@@ -215,6 +218,9 @@ func (e *DockerBuildExecutor) executeBuild(ctx context.Context, handle *localHan
 	if !e.retainContainer {
 		runArgs = append(runArgs, "--rm")
 	}
+	if e.maxMemory != "" {
+		runArgs = append(runArgs, "--memory", e.maxMemory)
+	}
 	runArgs = append(runArgs, "-v", fmt.Sprintf("%s:%s", hostOutputPath, path.Dir(plan.OutputPath)), imageTag)
 	err = e.cmdExecutor.Execute(ctx, CommandOptions{
 		Output: multiWriter,
@@ -265,13 +271,13 @@ func (e *DockerBuildExecutor) uploadAssets(ctx context.Context, plan *DockerBuil
 	if err := e.uploadContent(ctx, store, rebuild.DebugLogsAsset.For(input.Target), logs); err != nil {
 		log.Printf("Failed to upload build logs: %v", err)
 	}
-	// Save and upload container image.
-	imagePath := filepath.Join(hostOutputPath, string(rebuild.ContainerImageAsset))
-	if err := e.saveContainerImage(ctx, imageTag, imagePath); err != nil {
-		log.Printf("Failed to save container image: %v", err)
-	} else if err := e.uploadFile(ctx, store, rebuild.ContainerImageAsset.For(input.Target), imagePath); err != nil {
-		log.Printf("Failed to upload container image: %v", err)
-	}
+	// // Save and upload container image.
+	// imagePath := filepath.Join(hostOutputPath, string(rebuild.ContainerImageAsset))
+	// if err := e.saveContainerImage(ctx, imageTag, imagePath); err != nil {
+	// 	log.Printf("Failed to save container image: %v", err)
+	// } else if err := e.uploadFile(ctx, store, rebuild.ContainerImageAsset.For(input.Target), imagePath); err != nil {
+	// 	log.Printf("Failed to upload container image: %v", err)
+	// }
 }
 
 // uploadFile uploads a local file to the asset store.
