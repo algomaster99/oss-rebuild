@@ -88,7 +88,7 @@ func runBuild(coordinates []string, out chan<- string) {
 	}
 
 	buildHandle, err := localDockerExecutor.Start(ctx, inp, build.Options{
-		BuildID: strings.ReplaceAll(pkg, ":", "_") + "_" + version,
+		BuildID: strings.ReplaceAll(strings.ToLower(pkg), ":", "_") + "_" + strings.ToLower(version),
 		Resources: build.Resources{
 			AssetStore:      rebuild.NewFilesystemAssetStore(osfs.New(*localStore)),
 			BaseImageConfig: build.DefaultBaseImageConfig(),
