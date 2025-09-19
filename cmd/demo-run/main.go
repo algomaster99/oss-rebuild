@@ -14,22 +14,54 @@ import (
 	"strings"
 
 	"github.com/go-git/go-billy/v5/osfs"
+	"github.com/google/oss-rebuild/internal/llm"
 	"github.com/google/oss-rebuild/pkg/build"
 	"github.com/google/oss-rebuild/pkg/build/local"
 	"github.com/google/oss-rebuild/pkg/rebuild/rebuild"
 	"github.com/google/oss-rebuild/pkg/rebuild/schema"
 	"github.com/google/oss-rebuild/tools/ctl/pipe"
 	"github.com/pkg/errors"
+	"google.golang.org/genai"
 )
 
 var localStore = flag.String("localStore", "", "The base directory for logs.")
+var project = flag.String("project", "", "GCP project ID.")
 
 func runBuild(coordinates []string, out chan<- string) {
 	pkg := coordinates[1]
 	version := coordinates[2]
 	artifact := coordinates[3]
 
+	aiClient, _ := genai.NewClient(context.Background(), &genai.ClientConfig{
+		Backend:  genai.BackendVertexAI,
+		Project:  *project,
+		Location: "us-central1",
+	})
+
+	// Construct the prompt for the model.
+	prompt := fmt.Sprintf(`
+		Find the source code repository for the package '%s'.
+		Just return the URL WITHOUT any additional text.
+		Don't return anything other than the URL.
+	`, pkg)
+
+	config := &genai.GenerateContentConfig{
+		Temperature:     genai.Ptr(float32(0.1)),
+		MaxOutputTokens: int32(16000),
+	}
+
 	ctx := context.Background()
+
+	txt, err := llm.GenerateTextContent(ctx, aiClient, llm.GeminiFlash, config,
+		&genai.Part{
+			Text: prompt,
+		},
+	)
+	if err != nil {
+		log.Fatalf("Error generating text content: %v", err)
+	}
+
+	repoURL := strings.TrimSpace(txt)
 
 	inferenceOutputBufferStdout := &bytes.Buffer{}
 	inferenceOutputBufferStderr := &bytes.Buffer{}
@@ -46,7 +78,8 @@ func runBuild(coordinates []string, out chan<- string) {
 		"--ecosystem", "maven",
 		"--package", pkg,
 		"--version", version,
-		"--artifact", artifact)
+		"--artifact", artifact,
+		"--repo-hint", repoURL)
 	cmd.Stdout = inferenceOutputBufferStdout
 	cmd.Stderr = inferenceOutputBufferStderr
 
