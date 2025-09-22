@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/csv"
-	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -13,12 +12,7 @@ import (
 	"path"
 	"strings"
 
-	"github.com/go-git/go-billy/v5/osfs"
 	"github.com/google/oss-rebuild/internal/llm"
-	"github.com/google/oss-rebuild/pkg/build"
-	"github.com/google/oss-rebuild/pkg/build/local"
-	"github.com/google/oss-rebuild/pkg/rebuild/rebuild"
-	"github.com/google/oss-rebuild/pkg/rebuild/schema"
 	"github.com/google/oss-rebuild/tools/ctl/pipe"
 	"github.com/pkg/errors"
 	"google.golang.org/genai"
@@ -32,36 +26,60 @@ func runBuild(coordinates []string, out chan<- string) {
 	version := coordinates[2]
 	artifact := coordinates[3]
 
-	aiClient, _ := genai.NewClient(context.Background(), &genai.ClientConfig{
+	aiClient, err := genai.NewClient(context.Background(), &genai.ClientConfig{
 		Backend:  genai.BackendVertexAI,
 		Project:  *project,
 		Location: "us-central1",
 	})
+	if err != nil {
+		log.Fatalf("Error creating AI client: %v", err)
+	}
+	modelName := llm.GeminiPro
 
-	// Construct the prompt for the model.
 	prompt := fmt.Sprintf(`
 		Find the source code repository for the package '%s'.
 		Just return the URL WITHOUT any additional text.
-		Don't return anything other than the URL.
-	`, pkg)
-
+		The URL needs only have two paths after the domain name.
+		Do not include any submodules or subdirectories.
+		For example, for the package 'org.apache.camel:camel-support', return 'https://github.com/apache/camel' not 'https://github.com/apache/camel/tree/main/core/camel-support'.
+		Use the tools you have at your disposal to find the URL.`, pkg)
+	contents := []*genai.Content{
+		{
+			Parts: []*genai.Part{
+				{Text: prompt},
+			},
+			Role: genai.RoleUser,
+		},
+	}
 	config := &genai.GenerateContentConfig{
-		Temperature:     genai.Ptr(float32(0.1)),
-		MaxOutputTokens: int32(16000),
+		Temperature: genai.Ptr(float32(0.0)),
+		Tools: []*genai.Tool{
+			{GoogleSearch: &genai.GoogleSearch{}},
+		},
 	}
 
 	ctx := context.Background()
 
-	txt, err := llm.GenerateTextContent(ctx, aiClient, llm.GeminiFlash, config,
-		&genai.Part{
-			Text: prompt,
+	count, err := aiClient.Models.CountTokens(ctx, modelName, contents, &genai.CountTokensConfig{
+		Tools: []*genai.Tool{
+			{GoogleSearch: &genai.GoogleSearch{}},
 		},
-	)
+	})
 	if err != nil {
-		log.Fatalf("Error generating text content: %v", err)
+		log.Fatalf("Error counting tokens: %v", err)
+	}
+	if count.TotalTokens > 32_000 {
+		out <- fmt.Sprintf("%s,ERROR: prompt too long (%d tokens)", pkg, count.TotalTokens)
+		return
 	}
 
-	repoURL := strings.TrimSpace(txt)
+	resp, err := aiClient.Models.GenerateContent(ctx, modelName, contents, config)
+	if err != nil {
+		out <- fmt.Sprintf("%s,ERROR: generating content: %v", pkg, err)
+		return
+	}
+
+	repoURL := strings.TrimSpace(resp.Text())
 
 	inferenceOutputBufferStdout := &bytes.Buffer{}
 	inferenceOutputBufferStderr := &bytes.Buffer{}
@@ -85,60 +103,13 @@ func runBuild(coordinates []string, out chan<- string) {
 
 	err = cmd.Run()
 
-	inferenceLog.WriteString(fmt.Sprintf("%s\n STDOUT:\n%s\n\nSTDERR:\n%s\n%v\n", cmd.String(), inferenceOutputBufferStdout.String(), inferenceOutputBufferStderr.String(), err))
+	inferenceLog.WriteString(fmt.Sprintf("%s\nSTDOUT:\n%s\n\nSTDERR:\n%s\n%v\n", cmd.String(), inferenceOutputBufferStdout.String(), inferenceOutputBufferStderr.String(), err))
 
 	if err != nil {
-		out <- fmt.Sprintf("Inference failure for %s:%s:%s: %v\n", pkg, version, artifact, err)
+		out <- fmt.Sprintf("%s,ERROR: %v", pkg, err)
 		return
 	}
-
-	var schemaStrategy schema.StrategyOneOf
-	json.NewDecoder(inferenceOutputBufferStdout).Decode(&schemaStrategy)
-
-	s, err := schemaStrategy.Strategy()
-	if err != nil {
-		log.Fatal(errors.Wrap(err, "parsing strategy"))
-	}
-
-	inp := rebuild.Input{Target: rebuild.Target{
-		Ecosystem: rebuild.Maven,
-		Package:   pkg,
-		Version:   version,
-		Artifact:  artifact,
-	}, Strategy: s}
-	if err != nil {
-		log.Fatal(errors.Wrap(err, "generating plan"))
-	}
-
-	localDockerExecutor, err := local.NewDockerBuildExecutor(local.DockerBuildExecutorConfig{
-		MaxParallel:     6,
-		RetainContainer: false,
-		MaxMemory:       "10g",
-		TempDirBase:     path.Join(*localStore, "artifacts"),
-	})
-	if err != nil {
-		log.Fatal(errors.Wrap(err, "creating docker executor"))
-	}
-
-	buildHandle, err := localDockerExecutor.Start(ctx, inp, build.Options{
-		BuildID: strings.ReplaceAll(pkg, ":", "_") + "_" + version,
-		Resources: build.Resources{
-			AssetStore:      rebuild.NewFilesystemAssetStore(osfs.New(*localStore)),
-			BaseImageConfig: build.DefaultBaseImageConfig(),
-		},
-	})
-	if err != nil {
-		log.Fatal(errors.Wrap(err, "starting build"))
-	}
-
-	result, err := buildHandle.Wait(ctx)
-	out <- "Done with " + pkg + "\n"
-	if err != nil {
-		log.Printf("error waiting for build: %v", err)
-	}
-	if result.Error != nil {
-		log.Printf("build failed: %v", result.Error)
-	}
+	out <- fmt.Sprintf("%s,%s", pkg, repoURL)
 }
 
 func main() {
@@ -151,9 +122,22 @@ func main() {
 		panic(err)
 	}
 
+	directory := path.Join(*localStore)
+	os.MkdirAll(directory, 0755)
+
 	p := pipe.ParInto(6, pipe.FromSlice(records), runBuild)
 
+	summaryCsvPath := path.Join(*localStore, "summary.csv")
+	summaryCsvFile, err := os.Create(summaryCsvPath)
+	if err != nil {
+		log.Fatal(errors.Wrap(err, "creating summary CSV"))
+	}
+	defer summaryCsvFile.Close()
 	for msg := range p.Out() {
-		log.Print(msg)
+		log.Println(msg)
+		_, err := summaryCsvFile.WriteString(strings.TrimSpace(msg) + "\n")
+		if err != nil {
+			log.Fatal(errors.Wrap(err, "writing to summary CSV"))
+		}
 	}
 }
