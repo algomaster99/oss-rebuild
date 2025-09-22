@@ -32,36 +32,60 @@ func runBuild(coordinates []string, out chan<- string) {
 	version := coordinates[2]
 	artifact := coordinates[3]
 
-	aiClient, _ := genai.NewClient(context.Background(), &genai.ClientConfig{
+	aiClient, err := genai.NewClient(context.Background(), &genai.ClientConfig{
 		Backend:  genai.BackendVertexAI,
 		Project:  *project,
 		Location: "us-central1",
 	})
+	if err != nil {
+		log.Fatalf("Error creating AI client: %v", err)
+	}
+	modelName := llm.GeminiPro
 
-	// Construct the prompt for the model.
 	prompt := fmt.Sprintf(`
 		Find the source code repository for the package '%s'.
 		Just return the URL WITHOUT any additional text.
-		Don't return anything other than the URL.
-	`, pkg)
-
+		Do not include any submodules or subdirectories.
+		For example, for the package 'org.apache.camel:camel-support', return 'https://github.com/apache/camel' not 'https://github.com/apache/camel/tree/main/core/camel-support'.
+		Use the tools you have at your disposal to find the URL.
+		Finally, if you don't find the URL, just return an empty string.`, pkg)
+	contents := []*genai.Content{
+		{
+			Parts: []*genai.Part{
+				{Text: prompt},
+			},
+			Role: genai.RoleUser,
+		},
+	}
 	config := &genai.GenerateContentConfig{
-		Temperature:     genai.Ptr(float32(0.1)),
-		MaxOutputTokens: int32(16000),
+		Temperature: genai.Ptr(float32(0.0)),
+		Tools: []*genai.Tool{
+			{GoogleSearch: &genai.GoogleSearch{}},
+		},
 	}
 
 	ctx := context.Background()
 
-	txt, err := llm.GenerateTextContent(ctx, aiClient, llm.GeminiFlash, config,
-		&genai.Part{
-			Text: prompt,
+	count, err := aiClient.Models.CountTokens(ctx, modelName, contents, &genai.CountTokensConfig{
+		Tools: []*genai.Tool{
+			{GoogleSearch: &genai.GoogleSearch{}},
 		},
-	)
+	})
 	if err != nil {
-		log.Fatalf("Error generating text content: %v", err)
+		log.Fatalf("Error counting tokens: %v", err)
+	}
+	if count.TotalTokens > 32_000 {
+		out <- fmt.Sprintf("%s,ERROR: prompt too long (%d tokens)", pkg, count.TotalTokens)
+		return
 	}
 
-	repoURL := strings.TrimSpace(txt)
+	resp, err := aiClient.Models.GenerateContent(ctx, modelName, contents, config)
+	if err != nil {
+		out <- fmt.Sprintf("%s,ERROR: generating content: %v", pkg, err)
+		return
+	}
+
+	repoURL := strings.TrimSpace(resp.Text())
 
 	inferenceOutputBufferStdout := &bytes.Buffer{}
 	inferenceOutputBufferStderr := &bytes.Buffer{}
@@ -88,7 +112,7 @@ func runBuild(coordinates []string, out chan<- string) {
 	inferenceLog.WriteString(fmt.Sprintf("%sSTDOUT:\n%s\n\nSTDERR:\n%s\n%v\n", cmd.String(), inferenceOutputBufferStdout.String(), inferenceOutputBufferStderr.String(), err))
 
 	if err != nil {
-		out <- fmt.Sprintf("Inference failure for %s:%s:%s: %v\n", pkg, version, artifact, err)
+		out <- fmt.Sprintf("%s,ERROR: inference: %v\n", pkg, err)
 		return
 	}
 
@@ -132,7 +156,7 @@ func runBuild(coordinates []string, out chan<- string) {
 	}
 
 	result, err := buildHandle.Wait(ctx)
-	out <- "Done with " + pkg + "\n"
+	out <- fmt.Sprintf("%s,%s", pkg, "Build Succeeded")
 	if err != nil {
 		log.Printf("error waiting for build: %v", err)
 	}
@@ -151,9 +175,22 @@ func main() {
 		panic(err)
 	}
 
+	directory := path.Join(*localStore)
+	os.MkdirAll(directory, 0755)
+
 	p := pipe.ParInto(6, pipe.FromSlice(records), runBuild)
 
+	summaryCsvPath := path.Join(*localStore, "summary.csv")
+	summaryCsvFile, err := os.Create(summaryCsvPath)
+	if err != nil {
+		log.Fatal(errors.Wrap(err, "creating summary CSV"))
+	}
+	defer summaryCsvFile.Close()
 	for msg := range p.Out() {
-		log.Print(msg)
+		log.Println(msg)
+		_, err := summaryCsvFile.WriteString(strings.TrimSpace(msg) + "\n")
+		if err != nil {
+			log.Fatal(errors.Wrap(err, "writing to summary CSV"))
+		}
 	}
 }
