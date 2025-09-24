@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/csv"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -21,6 +22,11 @@ import (
 var localStore = flag.String("localStore", "", "The base directory for logs.")
 var project = flag.String("project", "", "GCP project ID.")
 
+type llmResponse struct {
+	RepoURL   string `json:"repoURL"`
+	Reasoning string `json:"reasoning"`
+}
+
 func runBuild(coordinates []string, out chan<- string) {
 	pkg := coordinates[1]
 	version := coordinates[2]
@@ -36,13 +42,14 @@ func runBuild(coordinates []string, out chan<- string) {
 	}
 	modelName := llm.GeminiPro
 
-	prompt := fmt.Sprintf(`
-		Find the source code repository for the package '%s'.
-		Just return the URL WITHOUT any additional text.
-		The URL needs only have two paths after the domain name.
-		Do not include any submodules or subdirectories.
-		For example, for the package 'org.apache.camel:camel-support', return 'https://github.com/apache/camel' not 'https://github.com/apache/camel/tree/main/core/camel-support'.
-		Use the tools you have at your disposal to find the URL.`, pkg)
+	prompt := fmt.Sprintf(`Your task is to find the source code repository for a given Maven package "%s".
+Analyze the package identifier and use the tools available to you to find the canonical git repository URL.
+
+Return your answer ONLY as a single JSON object with the following structure:
+{
+  "repoURL": "string | null",
+  "reasoning": "string"
+}`, pkg)
 	contents := []*genai.Content{
 		{
 			Parts: []*genai.Part{
@@ -52,21 +59,35 @@ func runBuild(coordinates []string, out chan<- string) {
 		},
 	}
 	config := &genai.GenerateContentConfig{
-		Temperature: genai.Ptr(float32(0.0)),
-		Tools: []*genai.Tool{
-			{GoogleSearch: &genai.GoogleSearch{}},
+		ResponseMIMEType: "application/json",
+		ResponseSchema: &genai.Schema{
+			Type: genai.TypeObject,
+			Properties: map[string]*genai.Schema{
+				"repoURL": {
+					Type: genai.TypeString,
+				},
+				"reasoning": {
+					Type: genai.TypeString,
+				},
+			},
+			Required: []string{"repoURL", "reasoning"},
 		},
+		Temperature: genai.Ptr(float32(0.0)),
+		// Tools: []*genai.Tool{
+		// 	{GoogleSearch: &genai.GoogleSearch{}},
+		// },
 	}
 
 	ctx := context.Background()
 
 	count, err := aiClient.Models.CountTokens(ctx, modelName, contents, &genai.CountTokensConfig{
-		Tools: []*genai.Tool{
-			{GoogleSearch: &genai.GoogleSearch{}},
-		},
+		// Tools: []*genai.Tool{
+		// 	{GoogleSearch: &genai.GoogleSearch{}},
+		// },
 	})
 	if err != nil {
-		log.Fatalf("Error counting tokens: %v", err)
+		out <- fmt.Sprintf("%s,ERROR: counting tokens: %v,", pkg, err)
+		return
 	}
 	if count.TotalTokens > 32_000 {
 		out <- fmt.Sprintf("%s,ERROR: prompt too long (%d tokens)", pkg, count.TotalTokens)
@@ -75,11 +96,16 @@ func runBuild(coordinates []string, out chan<- string) {
 
 	resp, err := aiClient.Models.GenerateContent(ctx, modelName, contents, config)
 	if err != nil {
-		out <- fmt.Sprintf("%s,ERROR: generating content: %v", pkg, err)
+		out <- fmt.Sprintf("%s,ERROR: generating content: %v,", pkg, err)
+		return
+	}
+	var decodedResp llmResponse
+	if err := json.Unmarshal([]byte(resp.Text()), &decodedResp); err != nil {
+		out <- fmt.Sprintf("%s,ERROR: decoding response: %v,", pkg, err)
 		return
 	}
 
-	repoURL := strings.TrimSpace(resp.Text())
+	repoURL := strings.TrimSpace(decodedResp.RepoURL)
 
 	inferenceOutputBufferStdout := &bytes.Buffer{}
 	inferenceOutputBufferStderr := &bytes.Buffer{}
@@ -106,10 +132,10 @@ func runBuild(coordinates []string, out chan<- string) {
 	inferenceLog.WriteString(fmt.Sprintf("%s\nSTDOUT:\n%s\n\nSTDERR:\n%s\n%v\n", cmd.String(), inferenceOutputBufferStdout.String(), inferenceOutputBufferStderr.String(), err))
 
 	if err != nil {
-		out <- fmt.Sprintf("%s,ERROR: %v", pkg, err)
+		out <- fmt.Sprintf("%s,ERROR: %v,%s", pkg, err, decodedResp.Reasoning)
 		return
 	}
-	out <- fmt.Sprintf("%s,%s", pkg, repoURL)
+	out <- fmt.Sprintf("%s,%s,%s", pkg, repoURL, decodedResp.Reasoning)
 }
 
 func main() {
