@@ -11,12 +11,10 @@ import (
 	"os"
 	"os/exec"
 	"path"
+	"regexp"
 	"strings"
 
-	"github.com/go-git/go-billy/v5/osfs"
 	"github.com/google/oss-rebuild/internal/llm"
-	"github.com/google/oss-rebuild/pkg/build"
-	"github.com/google/oss-rebuild/pkg/build/local"
 	"github.com/google/oss-rebuild/pkg/rebuild/rebuild"
 	"github.com/google/oss-rebuild/pkg/rebuild/schema"
 	"github.com/google/oss-rebuild/tools/ctl/pipe"
@@ -27,7 +25,7 @@ import (
 var localStore = flag.String("localStore", "", "The base directory for logs.")
 var project = flag.String("project", "", "GCP project ID.")
 var concurrency = flag.Int("concurrency", 2, "Number of concurrent builds.")
-var maxAttempts = flag.Int("maxAttempts", 2, "Maximum number of build attempts per package.")
+var maxAttempts = flag.Int("max-attempts", 2, "Maximum number of build attempts per package.")
 
 // runInference executes the 'ctl infer' command.
 // It logs stdout/stderr to logFilepath and returns the parsed strategy,
@@ -86,40 +84,42 @@ func runInference(ctx context.Context, pkg, version, artifact, repoURL, logFilep
 	return s, combinedLogs, nil
 }
 
-// runBuildInternal handles the actual build execution and waits for the result.
-func runBuildInternal(ctx context.Context, executor *local.DockerBuildExecutor, inp rebuild.Input, opts build.Options) (build.Result, error) {
-	buildHandle, err := executor.Start(ctx, inp, opts)
-	if err != nil {
-		return build.Result{}, errors.Wrap(err, "starting build")
-	}
-	// Wait(ctx) can return its own error (e.g., context canceled)
-	// and result.Error contains errors from within the build process.
-	result, waitErr := buildHandle.Wait(ctx)
-	return result, waitErr
-}
-
-// promptForRepoHint generates a prompt to find a repo URL based on failure logs.
+// promptForRepoHint generates a prompt to find a repo URL based on inference failure logs.
 func promptForRepoHint(pkg, inferenceLog string) string {
 	prompt := fmt.Sprintf(
-		"Based on the following logs for package '%s', find the correct source code repository URL.\n", pkg)
+		"Based on the following logs for package '%s', find the correct source code repository URL and provide an explanation of the reasoning behind your choice. Be brief.\n", pkg)
 
 	if inferenceLog != "" {
 		prompt += fmt.Sprintf("\nInference Logs:\n%s\n", inferenceLog)
 	}
 
 	prompt += `
-        Just return the URL WITHOUT any additional text.
-        Do not include any submodules or subdirectories.
-        For example, for the package 'org.apache.camel:camel-support', return 'https://github.com/apache/camel' not 'https://github.com/apache/camel/tree/main/core/camel-support'.
-        Use the tools you have at your disposal to find the URL.
-        Finally, if you don't find the URL, just return an empty string.`
+		The logs can have the following errors:
+		- "no git ref": This means the inference process could not find any commit or tag in the repository that matches the package version.
+		- "no valid git ref": This means the inference process found a commit or tag, but it did not correspond to the expected package version.
+		- "cloning repo":
+			- This can be either the repository is deleted or private
+			- the URL is a webpage
+			- it is a gitee repo
+			- SSH access is required. Usually the SSH is required for submodules.
+		- "unsupported repo type": This means the URL does not point to a git repository.
+		In all cases, the URL is likely incorrect or incomplete. Your task is to find the correct URL.
+		`
+
+	prompt += `
+        In your response, include the final URL on a new line, prefixed with "URL: ".
+        Do not include any submodules or subdirectories in the URL.
+        For example:
+        This package is part of the Apache Camel project, which is hosted on GitHub.
+        URL: https://github.com/apache/camel
+
+        If you cannot determine the URL, return an empty response.`
 
 	return prompt
 }
 
 // callAI executes a given prompt against the genai model.
 func callAI(ctx context.Context, aiClient *genai.Client, modelName, prompt string) (string, error) {
-	log.Printf("AI Prompt:\n%s\n", prompt)
 	contents := []*genai.Content{
 		{
 			Parts: []*genai.Part{
@@ -155,14 +155,29 @@ func callAI(ctx context.Context, aiClient *genai.Client, modelName, prompt strin
 	return strings.TrimSpace(resp.Text()), nil
 }
 
+// parseURLFromAIResponse extracts the reasoning and the URL from the AI's text response using regex.
+func parseURLFromAIResponse(responseText string) (string, string) {
+	// Regex to find a URL prefixed with "URL: " and capture the URL.
+	re := regexp.MustCompile(`URL:\s*(https?://[^\s]+)`)
+	matches := re.FindStringSubmatch(responseText)
+
+	var url string
+	if len(matches) > 1 {
+		// The first submatch (index 1) is the captured URL.
+		url = matches[1]
+	}
+
+	return responseText, url
+}
+
 // getRepoHint calls the AI model to find a repo URL based on failure logs.
 func getRepoHint(ctx context.Context, aiClient *genai.Client, modelName, pkg, inferenceLog string) (string, error) {
 	prompt := promptForRepoHint(pkg, inferenceLog)
 	return callAI(ctx, aiClient, modelName, prompt)
 }
 
-// runBuild orchestrates the iterative build process.
-func runBuild(coordinates []string, out chan<- string) {
+// runInferenceWithRetries orchestrates the iterative inference process.
+func runInferenceWithRetries(coordinates []string, out chan<- string) {
 	ctx := context.Background()
 	pkg := coordinates[1]
 	version := coordinates[2]
@@ -189,19 +204,6 @@ func runBuild(coordinates []string, out chan<- string) {
 		return
 	}
 
-	// Setup builder executor
-	localDockerExecutor, err := local.NewDockerBuildExecutor(local.DockerBuildExecutorConfig{
-		MaxParallel:     *concurrency,
-		RetainContainer: false,
-		MaxMemory:       "10g",
-		TempDirBase:     path.Join(*localStore, "artifacts"),
-	})
-	if err != nil {
-		log.Printf("Error creating docker executor: %v", err)
-		out <- fmt.Sprintf("%s,ERROR: creating docker executor: %v", pkg, err)
-		return
-	}
-
 	var repoURL string = ""
 	var infLogs string = ""
 	var strategy rebuild.Strategy = nil
@@ -209,34 +211,48 @@ func runBuild(coordinates []string, out chan<- string) {
 
 	// --- INFERENCE LOOP (Attempts 1 to maxAttempts) ---
 	for attempt := 1; attempt <= *maxAttempts; attempt++ {
-		if attempt > 1 {
+		var logMsg string
+		// Attempt 1 is Manual
+		if attempt == 1 {
+			logMsg = fmt.Sprintf("[%s] Starting attempt 1/%d (Manual)", pkg, *maxAttempts)
+		} else {
 			// Attempts 2+ are AI-assisted
 			log.Printf("[%s] Getting AI hint (with inference logs) for attempt %d...", pkg, attempt)
-			hint, err := getRepoHint(ctx, aiClient, modelName, pkg, infLogs)
+			fullAIResponse, err := getRepoHint(ctx, aiClient, modelName, pkg, infLogs)
 			if err != nil {
 				out <- fmt.Sprintf("%s,ERROR: AI hint failed for attempt %d: %v", pkg, attempt, err)
 				return
 			}
+
+			reasoning, hint := parseURLFromAIResponse(fullAIResponse)
+			log.Printf("[%s] AI Reasoning: %s", pkg, reasoning)
+
+			// Log reasoning to its own file
+			if reasoning != "" {
+				reasoningLogPath := path.Join(logDir, fmt.Sprintf("reasoning_%d.txt", attempt))
+				if err := os.WriteFile(reasoningLogPath, []byte(reasoning), 0644); err != nil {
+					log.Printf("[%s] WARNING: Failed to write reasoning log for attempt %d: %v", pkg, attempt, err)
+				}
+			}
+
 			if hint == "" {
-				out <- fmt.Sprintf("%s,ERROR: AI found no hint for attempt %d", pkg, attempt)
+				out <- fmt.Sprintf("%s,ERROR: AI found no hint for attempt %d. Full response: %s", pkg, attempt, fullAIResponse)
 				return
 			}
 			repoURL = hint
-			log.Printf("[%s] Got AI hint for attempt %d: %s", pkg, attempt, repoURL)
-		} else {
-			// Attempt 1 is Manual
-			log.Printf("[%s] Starting attempt 1/%d (Manual)", pkg, *maxAttempts)
+			logMsg = fmt.Sprintf("[%s] Starting attempt %d/%d (AI-Assisted, RepoHint: '%s')", pkg, attempt, *maxAttempts, repoURL)
 		}
 
 		// Run Inference
-		log.Printf("[%s] Starting inference attempt %d/%d (RepoHint: '%s')", pkg, attempt, *maxAttempts, repoURL)
+		log.Println(logMsg)
 		infLogFile := path.Join(logDir, fmt.Sprintf("inference_%d_log.txt", attempt))
 		strategy, infLogs, infErr = runInference(ctx, pkg, version, artifact, repoURL, infLogFile)
 
 		// Check success
 		if infErr == nil && strategy != nil {
 			log.Printf("[%s] Inference succeeded on attempt %d.", pkg, attempt)
-			break // Exit loop on success
+			out <- fmt.Sprintf("%s,Inference Succeeded (attempt %d)", pkg, attempt)
+			return // Exit on success
 		}
 
 		// Handle failure
@@ -249,46 +265,8 @@ func runBuild(coordinates []string, out chan<- string) {
 		// Otherwise, loop continues to next (AI-assisted) attempt
 	}
 
-	// --- BUILD PHASE (Runs exactly once, only if inference succeeded) ---
-	if strategy == nil {
-		// This should be unreachable if maxAttempts >= 1, but guards against loop failure
-		log.Printf("[%s] No valid strategy found after all attempts.", pkg)
-		out <- fmt.Sprintf("%s,ERROR: Inference failed on all %d attempts.", pkg, *maxAttempts)
-		return
-	}
-
-	log.Printf("[%s] Proceeding to build.", pkg)
-	inp := rebuild.Input{Target: rebuild.Target{
-		Ecosystem: rebuild.Maven,
-		Package:   pkg,
-		Version:   version,
-		Artifact:  artifact,
-	}, Strategy: strategy}
-
-	buildOpts := build.Options{
-		BuildID: fmt.Sprintf("%s_%s_build", strings.ReplaceAll(pkg, ":", "_"), version),
-		Resources: build.Resources{
-			AssetStore:      rebuild.NewFilesystemAssetStore(osfs.New(*localStore)),
-			BaseImageConfig: build.DefaultBaseImageConfig(),
-		},
-	}
-
-	result, buildErr := runBuildInternal(ctx, localDockerExecutor, inp, buildOpts)
-
-	// Report final build result
-	if buildErr == nil && result.Error == nil {
-		out <- fmt.Sprintf("%s,Build Succeeded", pkg)
-		log.Printf("[%s] Build Succeeded", pkg)
-	} else {
-		var buildLog string
-		if buildErr != nil {
-			buildLog += fmt.Sprintf("Build Wait Error: %v\n", buildErr)
-		}
-		if result.Error != nil {
-			buildLog += fmt.Sprintf("Build Result Error: %v\n", result.Error)
-		}
-		out <- fmt.Sprintf("%s,ERROR: Build Failed: %s", pkg, buildLog)
-		log.Printf("[%s] Build Failed: %s", pkg, buildLog)
+	if *maxAttempts < 1 {
+		out <- fmt.Sprintf("%s,ERROR: Invalid maxAttempts (%d)", pkg, *maxAttempts)
 	}
 }
 
@@ -309,7 +287,7 @@ func main() {
 	directory := path.Join(*localStore)
 	os.MkdirAll(directory, 0755)
 
-	p := pipe.ParInto(*concurrency, pipe.FromSlice(records), runBuild)
+	p := pipe.ParInto(*concurrency, pipe.FromSlice(records), runInferenceWithRetries)
 
 	summaryCsvPath := path.Join(*localStore, "summary.csv")
 	summaryCsvFile, err := os.Create(summaryCsvPath)
@@ -318,7 +296,7 @@ func main() {
 	}
 	defer summaryCsvFile.Close()
 	for msg := range p.Out() {
-		log.Println(msg) // Also log to stdout/stderr
+		log.Println(msg)
 		_, err := summaryCsvFile.WriteString(strings.TrimSpace(msg) + "\n")
 		if err != nil {
 			log.Fatal(errors.Wrap(err, "writing to summary CSV"))
