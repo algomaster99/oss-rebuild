@@ -15,6 +15,7 @@ import (
 
 	"github.com/go-git/go-billy/v5/osfs"
 	"github.com/google/oss-rebuild/internal/llm"
+	"github.com/google/oss-rebuild/internal/urlx"
 	"github.com/google/oss-rebuild/pkg/build"
 	"github.com/google/oss-rebuild/pkg/build/local"
 	"github.com/google/oss-rebuild/pkg/rebuild/rebuild"
@@ -104,6 +105,15 @@ func runBuild(coordinates []string, out chan<- string) {
 		"--version", version,
 		"--artifact", artifact,
 		"--repo-hint", repoURL)
+	cmd := exec.CommandContext(ctx, "docker", "run", "--rm", "--memory", "10g", "infer" // Add flags as needed)
+	stub := api.Stub[schema.InferenceRequest, schema.StrategyOneOf](client, urlx.MustParse("http://localhost:8080/infer"))
+	resp, err := stub(&schema.InferenceRequest{
+		Ecosystem: "maven",
+		Package:   pkg,
+		Version:   version,
+		Artifact:  artifact,
+		RepoHint:  repoURL,
+	})
 	cmd.Stdout = inferenceOutputBufferStdout
 	cmd.Stderr = inferenceOutputBufferStderr
 
