@@ -515,7 +515,7 @@ var runBenchmark = &cobra.Command{
 				ID:            runID,
 				BenchmarkName: filepath.Base(args[1]),
 				BenchmarkHash: hex.EncodeToString(set.Hash(sha256.New())),
-				Type:          string(schema.SmoketestMode),
+				Type:          string(mode),
 				Created:       now,
 			})); err != nil {
 				log.Println(errors.Wrap(err, "writing run to rundex"))
