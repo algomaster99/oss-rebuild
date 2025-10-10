@@ -499,10 +499,6 @@ var runBenchmark = &cobra.Command{
 		if *buildLocal {
 			now := time.Now().UTC()
 			runID = now.Format(time.RFC3339)
-			if concurrency != 1 {
-				log.Println("Note: dropping max concurrency to 1 due to local execution")
-			}
-			concurrency = 1
 			store, err := localfiles.AssetStore(runID)
 			if err != nil {
 				log.Fatalf("Failed to create temp directory: %v", err)

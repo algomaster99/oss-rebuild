@@ -265,13 +265,6 @@ func (e *DockerBuildExecutor) uploadAssets(ctx context.Context, plan *DockerBuil
 	if err := e.uploadContent(ctx, store, rebuild.DebugLogsAsset.For(input.Target), logs); err != nil {
 		log.Printf("Failed to upload build logs: %v", err)
 	}
-	// Save and upload container image.
-	imagePath := filepath.Join(hostOutputPath, string(rebuild.ContainerImageAsset))
-	if err := e.saveContainerImage(ctx, imageTag, imagePath); err != nil {
-		log.Printf("Failed to save container image: %v", err)
-	} else if err := e.uploadFile(ctx, store, rebuild.ContainerImageAsset.For(input.Target), imagePath); err != nil {
-		log.Printf("Failed to upload container image: %v", err)
-	}
 }
 
 // uploadFile uploads a local file to the asset store.
